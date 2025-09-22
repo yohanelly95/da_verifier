@@ -4,13 +4,13 @@ use std::time::Instant;
 use tracing::{error, info, warn};
 
 #[async_trait]
-pub trait DA_Verifier: Send + Sync {
+pub trait DAVerifier: Send + Sync {
     async fn verify(&self, height: u64) -> Result<VerificationResult, DAError>;
     fn name(&self) -> &str;
 }
 
 pub struct VerificationEngine {
-    verifiers: Vec<Box<dyn DA_Verifier>>,
+    verifiers: Vec<Box<dyn DAVerifier>>,
 }
 
 impl VerificationEngine {
@@ -20,7 +20,7 @@ impl VerificationEngine {
         }
     }
 
-    pub fn add_verifier(&mut self, verifier: Box<dyn DA_Verifier>) {
+    pub fn add_verifier(&mut self, verifier: Box<dyn DAVerifier>) {
         self.verifiers.push(verifier);
     }
 

@@ -90,8 +90,9 @@ impl Default for DAConfig {
         Self {
             celestia: Some(CelestiaConfig {
                 endpoints: vec![
-                    "https://rpc.celestia.com".to_string(),
-                    "https://public-celestia-rpc.numia.xyz".to_string(),
+                    "http://46.62.152.232:26658".to_string(),
+                    "https://celestia-rpc.brightlystake.com/api".to_string(),
+                    "https://celestia.rest.lava.build".to_string(),
                 ],
                 network: CelestiaNetwork::Mainnet,
                 namespace_id: None,

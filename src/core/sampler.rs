@@ -5,7 +5,7 @@ use tracing::{debug, info};
 
 pub struct RandomSampler {
     matrix_size: u32,
-    samples_needed: usize,
+    pub samples_needed: usize,
 }
 
 impl RandomSampler {

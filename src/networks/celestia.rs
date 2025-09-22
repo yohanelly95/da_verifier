@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 use std::time::Instant;
 use tracing::{debug, error, info};
 
+const CELESTIA_LIGHT_NODE_URL: &str = "http://46.62.152.232:26658";
+const CELESTIA_AUTH_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJBbGxvdyI6WyJwdWJsaWMiLCJyZWFkIiwid3JpdGUiLCJhZG1pbiJdLCJOb25jZSI6IklhMmhJVGpzV1lIc2tFYjlVNUVIWndsVjY0THBPd3FMYkNXejQyM0VhVzg9IiwiRXhwaXJlc0F0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoifQ.8lsptyuGE4wAamiBfTG1id3FTDXuKKfibfycLnk7A4";
+
 // Celestia-specific types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CelestiaHeader {
@@ -205,6 +208,7 @@ impl CelestiaVerifier {
         let response = self
             .client
             .post(&self.config.endpoints[0])
+            .header("Authorization", format!("Bearer {}", CELESTIA_AUTH_TOKEN))
             .json(&request)
             .send()
             .await
@@ -226,7 +230,7 @@ impl CelestiaVerifier {
             .ok_or_else(|| DAError::NetworkError("Empty header response".to_string()))
     }
 
-    /// Get a share with proof using Celestia's share.GetSharesByNamespace
+    /// Get a share with proof using Celestia's share.GetShare
     async fn get_share_with_proof(
         &self,
         height: u64,
@@ -234,17 +238,21 @@ impl CelestiaVerifier {
         row: u32,
         col: u32,
     ) -> Result<ShareProof, DAError> {
-        // First, we need to use share.GetShare to get a specific share
+        // Get extended header first to get proper context
+        let header = self.get_extended_header(height).await?;
+
+        // Use share.GetShare to get a specific share with coordinate
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "share.GetShare".to_string(),
-            params: json!([height, row, col]),
+            params: json!([header, row, col]),
             id: 2,
         };
 
         let response = self
             .client
             .post(&self.config.endpoints[0])
+            .header("Authorization", format!("Bearer {}", CELESTIA_AUTH_TOKEN))
             .json(&request)
             .send()
             .await
@@ -275,18 +283,18 @@ impl CelestiaVerifier {
             .decode(&share_data)
             .map_err(|e| DAError::NetworkError(format!("Failed to decode share: {}", e)))?;
 
-        // Now get the proof using share.GetSharesByNamespace for the namespace
-        let namespace_str = hex::encode(&namespace.id);
+        // Get proper proof using share.GetEDS (Extended Data Square)
         let request_proof = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            method: "share.GetSharesByNamespace".to_string(),
-            params: json!([height, namespace_str]),
+            method: "share.GetEDS".to_string(),
+            params: json!([height]),
             id: 3,
         };
 
         let proof_response = self
             .client
             .post(&self.config.endpoints[0])
+            .header("Authorization", format!("Bearer {}", CELESTIA_AUTH_TOKEN))
             .json(&request_proof)
             .send()
             .await
@@ -345,7 +353,7 @@ impl CelestiaVerifier {
                 }
 
                 // Calculate leaf hash for the share
-                let leaf_hash = self.calculate_share_hash(&proof.data);
+                let _leaf_hash = self.calculate_share_hash(&proof.data);
 
                 // Build merkle proof from the NMT proof
                 let merkle_proof = self.convert_to_merkle_proof(&proof);
@@ -410,26 +418,68 @@ impl CelestiaVerifier {
 
     /// Verify that a sample is valid against the data root
     fn verify_sample(&self, sample: &Sample, header: &CelestiaHeader) -> bool {
-        // In production, this would:
-        // 1. Verify the NMT proof against the row/column roots
-        // 2. Verify the row/column roots against the data availability header
-        // 3. Verify the DA header against the block data hash
-
-        // For now, basic verification that sample is non-empty and within bounds
+        // Basic verification that sample is non-empty and within bounds
         if sample.data.is_empty() {
+            debug!(
+                "Sample at ({}, {}) is empty",
+                sample.coord.row, sample.coord.col
+            );
             return false;
         }
 
         // Verify share size (Celestia uses 512-byte shares)
         if sample.data.len() != 512 {
             debug!(
-                "Invalid share size: {} bytes (expected 512)",
-                sample.data.len()
+                "Invalid share size: {} bytes (expected 512) at ({}, {})",
+                sample.data.len(),
+                sample.coord.row,
+                sample.coord.col
             );
             return false;
         }
 
-        true
+        // Verify coordinates are within data square bounds
+        let square_size = header.dah.row_roots.len() as u32;
+        if sample.coord.row >= square_size || sample.coord.col >= square_size {
+            debug!(
+                "Sample coordinates ({}, {}) outside square bounds ({}x{})",
+                sample.coord.row, sample.coord.col, square_size, square_size
+            );
+            return false;
+        }
+
+        // TODO: Implement proper NMT proof verification
+        // 1. Verify the merkle proof against the row/column roots
+        // 2. Verify the row/column roots against the data availability header
+        // 3. Verify namespace consistency
+
+        match &sample.proof {
+            Proof::Merkle(merkle_proof) => {
+                // Basic merkle proof structure validation
+                if merkle_proof.branch.is_empty() {
+                    debug!("Merkle proof has empty branch");
+                    return false;
+                }
+
+                if merkle_proof.branch.len() != merkle_proof.positions.len() {
+                    debug!("Merkle proof branch and positions length mismatch");
+                    return false;
+                }
+
+                // Calculate expected leaf hash and compare
+                let calculated_hash = self.calculate_share_hash(&sample.data);
+                if calculated_hash != merkle_proof.leaf_hash {
+                    debug!("Merkle proof leaf hash mismatch");
+                    return false;
+                }
+
+                true
+            }
+            _ => {
+                debug!("Unsupported proof type for Celestia");
+                false
+            }
+        }
     }
 }
 
@@ -440,13 +490,27 @@ impl DAVerifier for CelestiaVerifier {
         info!("Starting Celestia DAS for block {}", height);
 
         // Step 1: Get extended header to determine matrix size
-        let header = self.get_extended_header(height).await?;
+        let header = match self.get_extended_header(height).await {
+            Ok(h) => h,
+            Err(e) => {
+                error!("Failed to get header for height {}: {}", height, e);
+                return Err(e);
+            }
+        };
 
         // Calculate square size from row roots
         let square_size = header.dah.row_roots.len() as u32;
+
+        if square_size == 0 {
+            return Err(DAError::NetworkError(format!(
+                "Invalid block at height {}: empty data availability header",
+                height
+            )));
+        }
+
         info!(
-            "Celestia block has {}x{} data square",
-            square_size, square_size
+            "Celestia block {} has {}x{} data square",
+            height, square_size, square_size
         );
 
         // Update sampler with actual square size
@@ -455,40 +519,83 @@ impl DAVerifier for CelestiaVerifier {
         // Step 2: Generate random coordinates for sampling
         let coords = sampler.generate_coordinates();
 
-        // Step 3: Sample shares concurrently
+        // Step 3: Sample shares with error handling and retries
         let mut successful_samples = 0;
         let total_samples = coords.len();
+        let max_concurrent = std::cmp::min(coords.len(), 10); // Limit concurrent requests
 
-        // Use concurrent futures for parallel sampling
+        // Use semaphore to limit concurrent requests
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+
         use futures::future::join_all;
 
         let sample_futures: Vec<_> = coords
             .iter()
-            .map(|coord| self.sample_share(height, coord.row, coord.col))
+            .enumerate()
+            .map(|(i, coord)| {
+                let permit = semaphore.clone();
+                let coord = *coord;
+                async move {
+                    let _permit = match permit.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return Err((
+                                i,
+                                coord,
+                                DAError::NetworkError(
+                                    "Failed to acquire semaphore permit".to_string(),
+                                ),
+                            ));
+                        }
+                    };
+
+                    // Retry logic for sampling
+                    let mut attempts = 0;
+                    let max_attempts = 3;
+
+                    while attempts < max_attempts {
+                        match self.sample_share(height, coord.row, coord.col).await {
+                            Ok(sample) => return Ok((i, coord, sample)),
+                            Err(e) => {
+                                attempts += 1;
+                                if attempts >= max_attempts {
+                                    return Err((i, coord, e));
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(
+                                    100 * attempts as u64,
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+
+                    unreachable!()
+                }
+            })
             .collect();
 
         let sample_results = join_all(sample_futures).await;
 
-        for (i, result) in sample_results.into_iter().enumerate() {
+        for result in sample_results {
             match result {
-                Ok(sample) => {
+                Ok((i, coord, sample)) => {
                     if self.verify_sample(&sample, &header) {
                         successful_samples += 1;
                         debug!(
                             "✓ Sample {} at ({}, {}) verified successfully",
-                            i, coords[i].row, coords[i].col
+                            i, coord.row, coord.col
                         );
                     } else {
                         debug!(
                             "✗ Sample {} at ({}, {}) failed verification",
-                            i, coords[i].row, coords[i].col
+                            i, coord.row, coord.col
                         );
                     }
                 }
-                Err(e) => {
+                Err((i, coord, e)) => {
                     debug!(
-                        "✗ Sample {} at ({}, {}) unavailable: {}",
-                        i, coords[i].row, coords[i].col, e
+                        "✗ Sample {} at ({}, {}) unavailable after retries: {}",
+                        i, coord.row, coord.col, e
                     );
                 }
             }
@@ -498,13 +605,23 @@ impl DAVerifier for CelestiaVerifier {
         // Celestia uses 2D Reed-Solomon encoding with erasure rate of 0.25 (75% can be lost)
         let confidence = sampler.calculate_confidence(successful_samples, 0.25);
 
+        let is_available = confidence >= 0.999999;
+
         info!(
-            "Celestia DAS completed: {}/{} samples successful, confidence: {:.6}",
-            successful_samples, total_samples, confidence
+            "Celestia DAS completed for block {}: {}/{} samples successful, confidence: {:.6}, available: {}",
+            height, successful_samples, total_samples, confidence, is_available
         );
 
+        // Check if we have insufficient samples for a meaningful result
+        if successful_samples == 0 {
+            return Err(DAError::InsufficientSamples {
+                got: 0,
+                needed: total_samples,
+            });
+        }
+
         Ok(VerificationResult {
-            available: confidence >= 0.999999,
+            available: is_available,
             confidence,
             samples_verified: successful_samples,
             samples_total: total_samples,
@@ -516,7 +633,6 @@ impl DAVerifier for CelestiaVerifier {
         "Celestia"
     }
 }
-
 
 /// Parse a Celestia namespace from hex string
 pub fn parse_namespace(namespace_hex: &str) -> Result<Namespace, DAError> {
