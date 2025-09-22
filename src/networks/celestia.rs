@@ -6,15 +6,12 @@
 use crate::{config::*, core::*, types::*};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 use tracing::{debug, error, info};
-
-const CELESTIA_LIGHT_NODE_URL: &str = "http://46.62.152.232:26658";
-const CELESTIA_AUTH_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJBbGxvdyI6WyJwdWJsaWMiLCJyZWFkIiwid3JpdGUiLCJhZG1pbiJdLCJOb25jZSI6IklhMmhJVGpzV1lIc2tFYjlVNUVIWndsVjY0THBPd3FMYkNXejQyM0VhVzg9IiwiRXhwaXJlc0F0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoifQ.8lsptyuGE4wAamiBfTG1id3FTDXuKKfibfycLnk7A4";
 
 // Celestia-specific types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +55,7 @@ pub struct Version {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockID {
     pub hash: String,
+    #[serde(rename = "parts")]
     pub part_set_header: PartSetHeader,
 }
 
@@ -177,6 +175,8 @@ pub struct CelestiaVerifier {
     config: CelestiaConfig,
     client: Client,
     sampler: RandomSampler,
+    auth_token: Option<String>,
+    namespace: Namespace,
 }
 
 impl CelestiaVerifier {
@@ -188,16 +188,68 @@ impl CelestiaVerifier {
             .build()
             .expect("Failed to build HTTP client");
 
+        let mut config = config;
+        if config.auth_token.is_none() {
+            config.auth_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN").ok();
+        }
+
+        let auth_token = config.auth_token.clone();
+
+        let namespace = config
+            .namespace_id
+            .as_ref()
+            .map(|hex_ns| {
+                parse_namespace(hex_ns).unwrap_or_else(|e| {
+                    panic!(
+                        "Invalid namespace '{}' provided in configuration: {}",
+                        hex_ns,
+                        e
+                    )
+                })
+            })
+            .unwrap_or_else(|| Namespace {
+                version: 0,
+                id: vec![0u8; 28],
+            });
+
+        debug!(
+            endpoints = ?config.endpoints,
+            has_auth_token = auth_token.is_some(),
+            namespace_version = namespace.version,
+            namespace = %hex::encode(&namespace.id),
+            "Initialized Celestia verifier"
+        );
+
         Self {
             config,
             client,
             sampler: RandomSampler::new(128, sampling_config.samples_per_block), // Will be updated based on actual header
+            auth_token,
+            namespace,
         }
+    }
+
+    fn log_json_snippet(&self, context: &str, payload: &[u8]) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+
+        let text = String::from_utf8_lossy(payload);
+        let snippet: String = text.chars().take(512).collect();
+        debug!("{} payload (truncated to 512 chars): {}", context, snippet);
     }
 
     /// Get extended header from Celestia node
     async fn get_extended_header(&self, height: u64) -> Result<CelestiaHeader, DAError> {
         // Use header.GetByHeight RPC method
+        let endpoint = self
+            .config
+            .endpoints
+            .first()
+            .ok_or_else(|| DAError::NetworkError("No Celestia RPC endpoints configured".to_string()))?;
+
+        debug!(endpoint = %endpoint, height, "Sending header.GetByHeight request");
+
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "header.GetByHeight".to_string(),
@@ -205,16 +257,37 @@ impl CelestiaVerifier {
             id: 1,
         };
 
-        let response = self
-            .client
-            .post(&self.config.endpoints[0])
-            .header("Authorization", format!("Bearer {}", CELESTIA_AUTH_TOKEN))
+        let mut request_builder = self.client.post(endpoint);
+        if let Some(token) = &self.auth_token {
+            request_builder = request_builder.bearer_auth(token);
+        }
+
+        let response = request_builder
             .json(&request)
             .send()
             .await
             .map_err(|e| DAError::NetworkError(format!("Failed to get header: {}", e)))?;
 
-        let rpc_response: JsonRpcResponse<CelestiaHeader> = response.json().await.map_err(|e| {
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let mut message = format!("header.GetByHeight returned status {}", status);
+            if status == StatusCode::UNAUTHORIZED {
+                message.push_str(" (check CELESTIA_NODE_AUTH_TOKEN)");
+            }
+            if !body.is_empty() {
+                message.push_str(&format!(": {}", body));
+            }
+            return Err(DAError::NetworkError(message));
+        }
+
+        let payload = response.bytes().await.map_err(|e| {
+            DAError::NetworkError(format!("Failed to read header response body: {}", e))
+        })?;
+
+        self.log_json_snippet("header.GetByHeight", &payload);
+
+        let rpc_response: JsonRpcResponse<CelestiaHeader> = serde_json::from_slice(&payload).map_err(|e| {
             DAError::NetworkError(format!("Failed to parse header response: {}", e))
         })?;
 
@@ -225,9 +298,119 @@ impl CelestiaVerifier {
             )));
         }
 
-        rpc_response
+        let header = rpc_response
             .result
-            .ok_or_else(|| DAError::NetworkError("Empty header response".to_string()))
+            .ok_or_else(|| DAError::NetworkError("Empty header response".to_string()))?;
+
+        debug!(
+            header_height = %header.header.height,
+            chain_id = %header.header.chain_id,
+            row_roots = header.dah.row_roots.len(),
+            column_roots = header.dah.column_roots.len(),
+            "Received Celestia header"
+        );
+
+        Ok(header)
+    }
+
+    /// Get shares by namespace using Celestia's share.GetNamespaceData
+    async fn get_shares_by_namespace(
+        &self,
+        header: &CelestiaHeader,
+        namespace: &Namespace,
+    ) -> Result<Vec<Vec<u8>>, DAError> {
+        let endpoint = self
+            .config
+            .endpoints
+            .first()
+            .ok_or_else(|| DAError::NetworkError("No Celestia RPC endpoints configured".to_string()))?;
+
+        // Format namespace as base64 string (version byte + 28 byte ID)
+        let mut namespace_bytes = Vec::with_capacity(29);
+        namespace_bytes.push(namespace.version);
+        namespace_bytes.extend_from_slice(&namespace.id);
+        let namespace_b64 = base64::encode(&namespace_bytes);
+
+        debug!(
+            namespace_b64 = %namespace_b64,
+            height = %header.header.height,
+            "Querying shares by namespace"
+        );
+
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "share.GetNamespaceData".to_string(),
+            params: json!([header.header.height.parse::<u64>().unwrap_or(0), namespace_b64]),
+            id: 4,
+        };
+
+        let mut request_builder = self.client.post(endpoint);
+        if let Some(token) = &self.auth_token {
+            request_builder = request_builder.bearer_auth(token);
+        }
+
+        let response = request_builder
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| DAError::NetworkError(format!("Failed to get shares by namespace: {}", e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let mut message = format!("share.GetNamespaceData returned status {}", status);
+            if status == StatusCode::UNAUTHORIZED {
+                message.push_str(" (check CELESTIA_NODE_AUTH_TOKEN)");
+            }
+            if !body.is_empty() {
+                message.push_str(&format!(": {}", body));
+            }
+            return Err(DAError::NetworkError(message));
+        }
+
+        let payload = response.bytes().await.map_err(|e| {
+            DAError::NetworkError(format!("Failed to read shares by namespace response body: {}", e))
+        })?;
+
+        self.log_json_snippet("share.GetNamespaceData", &payload);
+
+        let rpc_response: JsonRpcResponse<serde_json::Value> = serde_json::from_slice(&payload).map_err(|e| {
+            DAError::NetworkError(format!("Failed to parse shares by namespace response: {}", e))
+        })?;
+
+        if let Some(error) = rpc_response.error {
+            return Err(DAError::NetworkError(format!(
+                "RPC error getting namespace data: {}",
+                error.message
+            )));
+        }
+
+        let shares_result = rpc_response
+            .result
+            .ok_or_else(|| DAError::NetworkError("Empty namespace data response".to_string()))?;
+
+        // Parse the shares array - expecting array of base64-encoded strings
+        let shares_array = shares_result
+            .as_array()
+            .ok_or_else(|| DAError::NetworkError("Invalid namespace data response format".to_string()))?;
+
+        let mut decoded_shares = Vec::new();
+        for share_value in shares_array {
+            if let Some(share_str) = share_value.as_str() {
+                let decoded = general_purpose::STANDARD
+                    .decode(share_str)
+                    .map_err(|e| DAError::NetworkError(format!("Failed to decode share: {}", e)))?;
+                decoded_shares.push(decoded);
+            }
+        }
+
+        debug!(
+            namespace_hex = %namespace_b64,
+            shares_count = decoded_shares.len(),
+            "Retrieved namespace data"
+        );
+
+        Ok(decoded_shares)
     }
 
     /// Get a share with proof using Celestia's share.GetShare
@@ -241,31 +424,56 @@ impl CelestiaVerifier {
         // Get extended header first to get proper context
         let header = self.get_extended_header(height).await?;
 
+        let endpoint = self
+            .config
+            .endpoints
+            .first()
+            .ok_or_else(|| DAError::NetworkError("No Celestia RPC endpoints configured".to_string()))?;
+
         // Use share.GetShare to get a specific share with coordinate
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "share.GetShare".to_string(),
-            params: json!([header, row, col]),
+            params: json!([height, row, col]),
             id: 2,
         };
 
-        let response = self
-            .client
-            .post(&self.config.endpoints[0])
-            .header("Authorization", format!("Bearer {}", CELESTIA_AUTH_TOKEN))
+        let mut request_builder = self.client.post(endpoint);
+        if let Some(token) = &self.auth_token {
+            request_builder = request_builder.bearer_auth(token);
+        }
+
+        let response = request_builder
             .json(&request)
             .send()
             .await
             .map_err(|e| DAError::NetworkError(format!("Failed to get share: {}", e)))?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
             return Err(DAError::SampleUnavailable { row, col });
         }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let mut message = format!("share.GetShare returned status {}", status);
+            if status == StatusCode::UNAUTHORIZED {
+                message.push_str(" (check CELESTIA_NODE_AUTH_TOKEN)");
+            }
+            if !body.is_empty() {
+                message.push_str(&format!(": {}", body));
+            }
+            return Err(DAError::NetworkError(message));
+        }
 
-        let rpc_response: JsonRpcResponse<String> = response
-            .json()
-            .await
-            .map_err(|e| DAError::NetworkError(format!("Failed to parse share response: {}", e)))?;
+        let payload = response.bytes().await.map_err(|e| {
+            DAError::NetworkError(format!("Failed to read share response body: {}", e))
+        })?;
+
+        self.log_json_snippet("share.GetShare", &payload);
+
+        let rpc_response: JsonRpcResponse<String> = serde_json::from_slice(&payload).map_err(|e| {
+            DAError::NetworkError(format!("Failed to parse share response: {}", e))
+        })?;
 
         if let Some(error) = rpc_response.error {
             return Err(DAError::NetworkError(format!(
@@ -283,6 +491,15 @@ impl CelestiaVerifier {
             .decode(&share_data)
             .map_err(|e| DAError::NetworkError(format!("Failed to decode share: {}", e)))?;
 
+        debug!(
+            row,
+            col,
+            share_len = decoded_share.len(),
+            namespace_version = namespace.version,
+            namespace = %hex::encode(&namespace.id),
+            "Decoded share payload"
+        );
+
         // Get proper proof using share.GetEDS (Extended Data Square)
         let request_proof = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -291,19 +508,40 @@ impl CelestiaVerifier {
             id: 3,
         };
 
-        let proof_response = self
-            .client
-            .post(&self.config.endpoints[0])
-            .header("Authorization", format!("Bearer {}", CELESTIA_AUTH_TOKEN))
+        let mut proof_request = self.client.post(endpoint);
+        if let Some(token) = &self.auth_token {
+            proof_request = proof_request.bearer_auth(token);
+        }
+
+        let proof_response = proof_request
             .json(&request_proof)
             .send()
             .await
             .map_err(|e| DAError::NetworkError(format!("Failed to get proof: {}", e)))?;
 
-        let proof_rpc_response: JsonRpcResponse<serde_json::Value> = proof_response
-            .json()
-            .await
-            .map_err(|e| DAError::NetworkError(format!("Failed to parse proof response: {}", e)))?;
+        let status = proof_response.status();
+        if !status.is_success() {
+            let body = proof_response.text().await.unwrap_or_default();
+            let mut message = format!("share.GetEDS returned status {}", status);
+            if status == StatusCode::UNAUTHORIZED {
+                message.push_str(" (check CELESTIA_NODE_AUTH_TOKEN)");
+            }
+            if !body.is_empty() {
+                message.push_str(&format!(": {}", body));
+            }
+            return Err(DAError::NetworkError(message));
+        }
+
+        let payload = proof_response.bytes().await.map_err(|e| {
+            DAError::NetworkError(format!("Failed to read proof response body: {}", e))
+        })?;
+
+        self.log_json_snippet("share.GetEDS", &payload);
+
+        let proof_rpc_response: JsonRpcResponse<serde_json::Value> =
+            serde_json::from_slice(&payload).map_err(|e| {
+                DAError::NetworkError(format!("Failed to parse proof response: {}", e))
+            })?;
 
         if let Some(error) = proof_rpc_response.error {
             return Err(DAError::NetworkError(format!(
@@ -314,7 +552,7 @@ impl CelestiaVerifier {
 
         // For now, construct a basic proof structure
         // In production, this would parse the actual proof from the response
-        Ok(ShareProof {
+        let proof = ShareProof {
             data: decoded_share,
             share_proofs: vec![],
             namespace: namespace.clone(),
@@ -325,25 +563,103 @@ impl CelestiaVerifier {
                 end_row: row,
             },
             row_roots: vec![],
-        })
+        };
+
+        debug!(
+            share_bytes = proof.data.len(),
+            nmt_proofs = proof.share_proofs.len(),
+            row_roots = proof.row_roots.len(),
+            "Constructed share proof placeholder"
+        );
+
+        Ok(proof)
+    }
+
+    /// Sample shares from namespace if specified, otherwise sample random coordinates
+    async fn sample_namespace_aware(
+        &self,
+        height: u64,
+        header: &CelestiaHeader,
+        coords: &[Coordinate],
+    ) -> Result<Vec<Sample>, DAError> {
+        // Check if we have a specific namespace (not the default 0x00 namespace)
+        let has_specific_namespace = self.namespace.version != 0 ||
+            !self.namespace.id.iter().all(|&b| b == 0);
+
+        if has_specific_namespace {
+            // Get all shares for this namespace first
+            let namespace_shares = self.get_shares_by_namespace(header, &self.namespace).await?;
+
+            if namespace_shares.is_empty() {
+                debug!(
+                    namespace = %hex::encode(&self.namespace.id),
+                    height,
+                    "No shares found in namespace at this height"
+                );
+                return Ok(vec![]); // No shares in this namespace at this height
+            }
+
+            debug!(
+                namespace_shares_count = namespace_shares.len(),
+                namespace = %hex::encode(&self.namespace.id),
+                height,
+                "Found shares in namespace, sampling from them"
+            );
+
+            // Sample from the namespace shares
+            let mut samples = Vec::new();
+            let sample_count = std::cmp::min(coords.len(), namespace_shares.len());
+
+            for i in 0..sample_count {
+                let coord = coords[i];
+                let share_data = &namespace_shares[i % namespace_shares.len()];
+
+                // Create a merkle proof for this share
+                let leaf_hash = self.calculate_share_hash(share_data);
+                let merkle_proof = MerkleProof {
+                    leaf_hash,
+                    branch: vec![[0u8; 32]; 10], // Placeholder proof structure
+                    positions: vec![false; 10],
+                };
+
+                samples.push(Sample {
+                    coord,
+                    data: share_data.clone(),
+                    proof: Proof::Merkle(merkle_proof),
+                });
+            }
+
+            Ok(samples)
+        } else {
+            // Default behavior: sample random coordinates
+            let mut samples = Vec::new();
+            for coord in coords {
+                match self.sample_share(height, coord.row, coord.col).await {
+                    Ok(sample) => samples.push(sample),
+                    Err(e) => {
+                        debug!("Failed to sample share at ({}, {}): {}", coord.row, coord.col, e);
+                        // Continue with other samples
+                    }
+                }
+            }
+            Ok(samples)
+        }
     }
 
     /// Sample a share at specific coordinates
     async fn sample_share(&self, height: u64, row: u32, col: u32) -> Result<Sample, DAError> {
         debug!(
-            "Sampling share at height {} position ({}, {})",
-            height, row, col
+            height,
+            row,
+            col,
+            namespace_version = self.namespace.version,
+            namespace = %hex::encode(&self.namespace.id),
+            "Sampling share for Celestia"
         );
-
-        // Default namespace (0x00 for primary namespace)
-        let namespace = Namespace {
-            version: 0,
-            id: vec![0u8; 28], // Celestia uses 29-byte namespaces (1 version + 28 ID)
-        };
 
         // Try to get the share with proof
         match self
-            .get_share_with_proof(height, &namespace, row, col)
+            .get_share_with_proof(height, &self.namespace, row, col)
             .await
         {
             Ok(proof) => {
@@ -509,8 +825,13 @@ impl DAVerifier for CelestiaVerifier {
         }
 
         info!(
-            "Celestia block {} has {}x{} data square",
-            height, square_size, square_size
+            height,
+            square_size,
+            row_roots = header.dah.row_roots.len(),
+            column_roots = header.dah.column_roots.len(),
+            namespace_version = self.namespace.version,
+            namespace = %hex::encode(&self.namespace.id),
+            "Celestia block dimensions determined"
         );
 
         // Update sampler with actual square size
@@ -519,85 +840,33 @@ impl DAVerifier for CelestiaVerifier {
         // Step 2: Generate random coordinates for sampling
         let coords = sampler.generate_coordinates();
 
-        // Step 3: Sample shares with error handling and retries
+        // Step 3: Sample shares using namespace-aware sampling
+        let samples = self.sample_namespace_aware(height, &header, &coords).await?;
+
         let mut successful_samples = 0;
-        let total_samples = coords.len();
-        let max_concurrent = std::cmp::min(coords.len(), 10); // Limit concurrent requests
+        let total_samples = samples.len();
 
-        // Use semaphore to limit concurrent requests
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        // If no samples were retrieved (e.g., namespace not found), report appropriately
+        if samples.is_empty() {
+            info!(
+                height,
+                namespace = %hex::encode(&self.namespace.id),
+                "No samples found - namespace may not have data at this height"
+            );
+        }
 
-        use futures::future::join_all;
-
-        let sample_futures: Vec<_> = coords
-            .iter()
-            .enumerate()
-            .map(|(i, coord)| {
-                let permit = semaphore.clone();
-                let coord = *coord;
-                async move {
-                    let _permit = match permit.acquire().await {
-                        Ok(p) => p,
-                        Err(_) => {
-                            return Err((
-                                i,
-                                coord,
-                                DAError::NetworkError(
-                                    "Failed to acquire semaphore permit".to_string(),
-                                ),
-                            ));
-                        }
-                    };
-
-                    // Retry logic for sampling
-                    let mut attempts = 0;
-                    let max_attempts = 3;
-
-                    while attempts < max_attempts {
-                        match self.sample_share(height, coord.row, coord.col).await {
-                            Ok(sample) => return Ok((i, coord, sample)),
-                            Err(e) => {
-                                attempts += 1;
-                                if attempts >= max_attempts {
-                                    return Err((i, coord, e));
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(
-                                    100 * attempts as u64,
-                                ))
-                                .await;
-                            }
-                        }
-                    }
-
-                    unreachable!()
-                }
-            })
-            .collect();
-
-        let sample_results = join_all(sample_futures).await;
-
-        for result in sample_results {
-            match result {
-                Ok((i, coord, sample)) => {
-                    if self.verify_sample(&sample, &header) {
-                        successful_samples += 1;
-                        debug!(
-                            "✓ Sample {} at ({}, {}) verified successfully",
-                            i, coord.row, coord.col
-                        );
-                    } else {
-                        debug!(
-                            "✗ Sample {} at ({}, {}) failed verification",
-                            i, coord.row, coord.col
-                        );
-                    }
-                }
-                Err((i, coord, e)) => {
-                    debug!(
-                        "✗ Sample {} at ({}, {}) unavailable after retries: {}",
-                        i, coord.row, coord.col, e
-                    );
-                }
+        for (i, sample) in samples.iter().enumerate() {
+            if self.verify_sample(sample, &header) {
+                successful_samples += 1;
+                debug!(
+                    "✓ Sample {} at ({}, {}) verified successfully",
+                    i, sample.coord.row, sample.coord.col
+                );
+            } else {
+                debug!(
+                    "✗ Sample {} at ({}, {}) failed verification",
+                    i, sample.coord.row, sample.coord.col
+                );
             }
         }
 
@@ -639,17 +908,20 @@ pub fn parse_namespace(namespace_hex: &str) -> Result<Namespace, DAError> {
     let bytes = hex::decode(namespace_hex)
         .map_err(|e| DAError::NetworkError(format!("Invalid namespace hex: {}", e)))?;
 
-    if bytes.len() != 29 {
-        return Err(DAError::NetworkError(format!(
-            "Invalid namespace length: {} (expected 29)",
-            bytes.len()
-        )));
+    match bytes.len() {
+        28 => Ok(Namespace {
+            version: 0,
+            id: bytes,
+        }),
+        29 => Ok(Namespace {
+            version: bytes[0],
+            id: bytes[1..].to_vec(),
+        }),
+        len => Err(DAError::NetworkError(format!(
+            "Invalid namespace length: {} (expected 28 or 29 bytes)",
+            len
+        ))),
     }
-
-    Ok(Namespace {
-        version: bytes[0],
-        id: bytes[1..].to_vec(),
-    })
 }
 
 /// Generate a random namespace for testing
@@ -673,6 +945,7 @@ mod tests {
             endpoints: vec!["https://rpc.lunaroasis.net".to_string()],
             network: CelestiaNetwork::Mainnet,
             namespace_id: None,
+            auth_token: None,
         };
 
         let verifier = CelestiaVerifier::new(
@@ -705,6 +978,7 @@ mod tests {
             endpoints: vec!["https://rpc.lunaroasis.net".to_string()],
             network: CelestiaNetwork::Mainnet,
             namespace_id: Some("00".repeat(28)), // Default namespace
+            auth_token: None,
         };
 
         let sampling_config = SamplingConfig {

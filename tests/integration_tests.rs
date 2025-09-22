@@ -10,6 +10,7 @@ async fn test_celestia_header_fetch() {
         endpoints: vec!["https://rpc-celestia.alphab.ai".to_string()],
         network: CelestiaNetwork::Mainnet,
         namespace_id: None,
+        auth_token: None,
     };
 
     let sampling_config = SamplingConfig {
@@ -50,6 +51,7 @@ async fn test_celestia_testnet() {
         endpoints: vec!["https://rpc-mocha.pops.one".to_string()],
         network: CelestiaNetwork::Mocha,
         namespace_id: None,
+        auth_token: None,
     };
 
     let sampling_config = SamplingConfig {
@@ -87,6 +89,7 @@ async fn test_invalid_height() {
         endpoints: vec!["https://rpc-celestia.alphab.ai".to_string()],
         network: CelestiaNetwork::Mainnet,
         namespace_id: None,
+        auth_token: None,
     };
 
     let sampling_config = SamplingConfig {
@@ -133,12 +136,14 @@ fn test_celestia_config_networks() {
         endpoints: vec!["https://rpc-celestia.alphab.ai".to_string()],
         network: CelestiaNetwork::Mainnet,
         namespace_id: None,
+        auth_token: None,
     };
 
     let mocha_config = CelestiaConfig {
         endpoints: vec!["https://rpc-mocha.pops.one".to_string()],
         network: CelestiaNetwork::Mocha,
         namespace_id: Some("test".to_string()),
+        auth_token: None,
     };
 
     assert!(!mainnet_config.endpoints.is_empty());
@@ -154,6 +159,7 @@ fn test_verifier_name() {
         endpoints: vec!["http://localhost:26658".to_string()],
         network: CelestiaNetwork::Mainnet,
         namespace_id: None,
+        auth_token: None,
     };
 
     let sampling_config = SamplingConfig {

@@ -25,6 +25,7 @@ pub struct CelestiaConfig {
     pub endpoints: Vec<String>,
     pub network: CelestiaNetwork,
     pub namespace_id: Option<String>,
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +97,7 @@ impl Default for DAConfig {
                 ],
                 network: CelestiaNetwork::Mainnet,
                 namespace_id: None,
+                auth_token: None,
             }),
             ethereum: Some(EthereumConfig {
                 beacon_endpoints: vec!["https://beacon-nd-mainnet.ethereum.org".to_string()],

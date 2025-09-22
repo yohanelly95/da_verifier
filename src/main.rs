@@ -3,7 +3,7 @@ use da_verifier::{
     CelestiaConfig, CelestiaNetwork, CelestiaVerifier, DAConfig, DAVerifier, SamplingConfig,
 };
 use std::time::Instant;
-use tracing::{info, warn, Level};
+use tracing::{Level, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
@@ -115,7 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "mocha" => CelestiaNetwork::Mocha,
                 "arabica" => CelestiaNetwork::Arabica,
                 _ => {
-                    eprintln!("Invalid network: {}. Use 'mainnet', 'mocha', or 'arabica'", network);
+                    eprintln!(
+                        "Invalid network: {}. Use 'mainnet', 'mocha', or 'arabica'",
+                        network
+                    );
                     std::process::exit(1);
                 }
             };
@@ -128,10 +131,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 default_config.celestia.unwrap().endpoints
             };
 
+            let auth_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN").ok();
+
             let config = CelestiaConfig {
                 endpoints,
                 network,
                 namespace_id: namespace,
+                auth_token,
             };
 
             let sampling_config = SamplingConfig {
@@ -144,7 +150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let verifier = CelestiaVerifier::new(config, &sampling_config);
 
-            info!("Verifying Celestia block {} with {} samples", height, cli.samples);
+            info!(
+                "Verifying Celestia block {} with {} samples",
+                height, cli.samples
+            );
             let start = Instant::now();
 
             match verifier.verify(height).await {
@@ -153,9 +162,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     println!("\n📊 Verification Results for Celestia Block {}", height);
                     println!("═══════════════════════════════════════════════");
-                    println!("✅ Data Available: {}", if result.available { "YES" } else { "NO" });
-                    println!("🎯 Confidence: {:.6} ({:.4}%)", result.confidence, result.confidence * 100.0);
-                    println!("📈 Samples: {}/{} successful", result.samples_verified, result.samples_total);
+                    println!(
+                        "✅ Data Available: {}",
+                        if result.available { "YES" } else { "NO" }
+                    );
+                    println!(
+                        "🎯 Confidence: {:.6} ({:.4}%)",
+                        result.confidence,
+                        result.confidence * 100.0
+                    );
+                    println!(
+                        "📈 Samples: {}/{} successful",
+                        result.samples_verified, result.samples_total
+                    );
                     println!("⏱️  Latency: {}ms", result.latency_ms);
                     println!("🕐 Total Duration: {:?}", duration);
 
@@ -169,7 +188,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Range { start, end, layer, endpoint: _ } => {
+        Commands::Range {
+            start,
+            end,
+            layer,
+            endpoint: _,
+        } => {
             if layer != "celestia" {
                 eprintln!("Only Celestia is currently supported");
                 std::process::exit(1);
@@ -182,7 +206,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Use default configuration
             let default_config = DAConfig::default();
-            let config = default_config.celestia.unwrap();
+            let mut config = default_config.celestia.unwrap();
+            if config.auth_token.is_none() {
+                config.auth_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN").ok();
+            }
 
             let sampling_config = SamplingConfig {
                 samples_per_block: cli.samples,
@@ -194,7 +221,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let verifier = CelestiaVerifier::new(config, &sampling_config);
 
-            println!("\n🔍 Verifying Celestia blocks {} to {} ({} blocks)", start, end, end - start + 1);
+            println!(
+                "\n🔍 Verifying Celestia blocks {} to {} ({} blocks)",
+                start,
+                end,
+                end - start + 1
+            );
             println!("═══════════════════════════════════════════════");
 
             let mut total_available = 0;
@@ -213,8 +245,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let status = if result.available { "✅" } else { "❌" };
                         println!(
                             "{} Block {}: {:.4}% confidence, {}/{} samples, {}ms",
-                            status, height, result.confidence * 100.0,
-                            result.samples_verified, result.samples_total, result.latency_ms
+                            status,
+                            height,
+                            result.confidence * 100.0,
+                            result.samples_verified,
+                            result.samples_total,
+                            result.latency_ms
                         );
                     }
                     Err(e) => {
@@ -226,9 +262,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let total_duration = verification_start.elapsed();
             println!("\n📊 Range Verification Summary");
             println!("═══════════════════════════════════════════════");
-            println!("📈 Available blocks: {}/{} ({:.1}%)",
-                total_available, total_blocks,
-                (total_available as f64 / total_blocks as f64) * 100.0);
+            println!(
+                "📈 Available blocks: {}/{} ({:.1}%)",
+                total_available,
+                total_blocks,
+                (total_available as f64 / total_blocks as f64) * 100.0
+            );
             println!("🕐 Total time: {:?}", total_duration);
             println!("⚡ Average per block: {:?}", total_duration / total_blocks);
         }
@@ -250,6 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 endpoints,
                 network: CelestiaNetwork::Mainnet,
                 namespace_id: None,
+                auth_token: std::env::var("CELESTIA_NODE_AUTH_TOKEN").ok(),
             };
 
             let sampling_config = SamplingConfig {
@@ -270,8 +310,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match verifier.verify(test_height).await {
                 Ok(result) => {
                     println!("✅ Connection successful!");
-                    println!("📊 Test verification: {:.4}% confidence, {}/{} samples",
-                        result.confidence * 100.0, result.samples_verified, result.samples_total);
+                    println!(
+                        "📊 Test verification: {:.4}% confidence, {}/{} samples",
+                        result.confidence * 100.0,
+                        result.samples_verified,
+                        result.samples_total
+                    );
                 }
                 Err(e) => {
                     eprintln!("❌ Connection failed: {}", e);
