@@ -26,6 +26,8 @@ clap = { version = "4.0", features = ["derive"] }
 config = "0.13"
 prometheus = "0.13"
 warp = "0.3"
+futures = "0.3"
+sha2 = "0.10"
 
 # Ethereum specific
 ethers = "2.0"
