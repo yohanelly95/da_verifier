@@ -13,6 +13,12 @@ use sha2::{Digest, Sha256};
 use std::time::Instant;
 use tracing::{debug, error, info};
 
+// NMT constants for Celestia
+const NAMESPACE_SIZE: usize = 29; // 1 byte version + 28 bytes ID
+const HASH_SIZE: usize = 32;
+const NMT_LEAF_PREFIX: u8 = 0;
+const NMT_NODE_PREFIX: u8 = 1;
+
 // Celestia-specific types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CelestiaHeader {
@@ -123,14 +129,6 @@ pub struct ShareProof {
     pub row_roots: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NMTProof {
-    pub start: u32,
-    pub end: u32,
-    pub nodes: Vec<String>,
-    pub leaf_hash: String,
-    pub is_max_namespace_ignored: bool,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowProof {
@@ -169,6 +167,96 @@ struct JsonRpcError {
     code: i64,
     message: String,
     data: Option<serde_json::Value>,
+}
+
+// Structures for parsing GetNamespaceData response
+#[derive(Debug, Deserialize)]
+struct NamespaceDataResponse {
+    shares: Vec<String>, // Base64-encoded shares
+    proof: NamespaceProof,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamespaceProof {
+    end: u32,
+    nodes: Vec<String>, // Base64-encoded NMT nodes
+    is_max_namespace_ignored: bool,
+}
+
+// NMT hash functions for Celestia verification
+impl CelestiaVerifier {
+    /// Hash a leaf node with namespace prefix (NMT leaf)
+    fn hash_nmt_leaf(namespace: &[u8; NAMESPACE_SIZE], data: &[u8]) -> [u8; HASH_SIZE] {
+        let mut hasher = Sha256::new();
+        hasher.update([NMT_LEAF_PREFIX]); // Leaf prefix
+        hasher.update(namespace); // Min namespace
+        hasher.update(namespace); // Max namespace (same for leaf)
+        hasher.update(data); // Share data
+
+        let result = hasher.finalize();
+        let mut hash = [0u8; HASH_SIZE];
+        hash.copy_from_slice(&result);
+        hash
+    }
+
+    /// Hash two NMT nodes together (internal node)
+    fn hash_nmt_node(
+        left_min_ns: &[u8; NAMESPACE_SIZE],
+        left_max_ns: &[u8; NAMESPACE_SIZE],
+        left_hash: &[u8; HASH_SIZE],
+        right_min_ns: &[u8; NAMESPACE_SIZE],
+        right_max_ns: &[u8; NAMESPACE_SIZE],
+        right_hash: &[u8; HASH_SIZE],
+    ) -> ([u8; NAMESPACE_SIZE], [u8; NAMESPACE_SIZE], [u8; HASH_SIZE]) {
+        let mut hasher = Sha256::new();
+        hasher.update([NMT_NODE_PREFIX]); // Node prefix
+        hasher.update(left_min_ns); // Left min namespace
+        hasher.update(left_max_ns); // Left max namespace
+        hasher.update(left_hash); // Left hash
+        hasher.update(right_min_ns); // Right min namespace
+        hasher.update(right_max_ns); // Right max namespace
+        hasher.update(right_hash); // Right hash
+
+        let result = hasher.finalize();
+        let mut hash = [0u8; HASH_SIZE];
+        hash.copy_from_slice(&result);
+
+        // Combined namespace range
+        let min_ns = if left_min_ns <= right_min_ns { *left_min_ns } else { *right_min_ns };
+        let max_ns = if left_max_ns >= right_max_ns { *left_max_ns } else { *right_max_ns };
+
+        (min_ns, max_ns, hash)
+    }
+
+    /// Parse a base64-encoded NMT node into namespace range and hash
+    fn parse_nmt_node(node_b64: &str) -> Result<NMTNode, DAError> {
+        let decoded = general_purpose::STANDARD
+            .decode(node_b64)
+            .map_err(|e| DAError::NetworkError(format!("Failed to decode NMT node: {}", e)))?;
+
+        // NMT node format: min_ns (29) + max_ns (29) + hash (32) = 90 bytes total
+        if decoded.len() != NAMESPACE_SIZE * 2 + HASH_SIZE {
+            return Err(DAError::NetworkError(format!(
+                "Invalid NMT node size: {} bytes (expected {})",
+                decoded.len(),
+                NAMESPACE_SIZE * 2 + HASH_SIZE
+            )));
+        }
+
+        let mut min_namespace = [0u8; NAMESPACE_SIZE];
+        let mut max_namespace = [0u8; NAMESPACE_SIZE];
+        let mut digest = [0u8; HASH_SIZE];
+
+        min_namespace.copy_from_slice(&decoded[..NAMESPACE_SIZE]);
+        max_namespace.copy_from_slice(&decoded[NAMESPACE_SIZE..NAMESPACE_SIZE * 2]);
+        digest.copy_from_slice(&decoded[NAMESPACE_SIZE * 2..]);
+
+        Ok(NMTNode {
+            min_namespace,
+            max_namespace,
+            digest,
+        })
+    }
 }
 
 pub struct CelestiaVerifier {
@@ -313,12 +401,12 @@ impl CelestiaVerifier {
         Ok(header)
     }
 
-    /// Get shares by namespace using Celestia's share.GetNamespaceData
-    async fn get_shares_by_namespace(
+    /// Get shares with NMT proofs by namespace using Celestia's share.GetNamespaceData
+    async fn get_namespace_data_with_proofs(
         &self,
         header: &CelestiaHeader,
         namespace: &Namespace,
-    ) -> Result<Vec<Vec<u8>>, DAError> {
+    ) -> Result<Vec<NMTProof>, DAError> {
         let endpoint = self
             .config
             .endpoints
@@ -374,7 +462,7 @@ impl CelestiaVerifier {
 
         self.log_json_snippet("share.GetNamespaceData", &payload);
 
-        let rpc_response: JsonRpcResponse<serde_json::Value> = serde_json::from_slice(&payload).map_err(|e| {
+        let rpc_response: JsonRpcResponse<Vec<NamespaceDataResponse>> = serde_json::from_slice(&payload).map_err(|e| {
             DAError::NetworkError(format!("Failed to parse shares by namespace response: {}", e))
         })?;
 
@@ -385,32 +473,55 @@ impl CelestiaVerifier {
             )));
         }
 
-        let shares_result = rpc_response
+        let namespace_data_array = rpc_response
             .result
             .ok_or_else(|| DAError::NetworkError("Empty namespace data response".to_string()))?;
 
-        // Parse the shares array - expecting array of base64-encoded strings
-        let shares_array = shares_result
-            .as_array()
-            .ok_or_else(|| DAError::NetworkError("Invalid namespace data response format".to_string()))?;
+        let mut nmt_proofs = Vec::new();
 
-        let mut decoded_shares = Vec::new();
-        for share_value in shares_array {
-            if let Some(share_str) = share_value.as_str() {
+        for (row_index, namespace_data) in namespace_data_array.iter().enumerate() {
+            // Decode all shares in this row
+            let mut row_shares = Vec::new();
+            for share_b64 in &namespace_data.shares {
                 let decoded = general_purpose::STANDARD
-                    .decode(share_str)
+                    .decode(share_b64)
                     .map_err(|e| DAError::NetworkError(format!("Failed to decode share: {}", e)))?;
-                decoded_shares.push(decoded);
+                row_shares.push(decoded);
+            }
+
+            // Create NMT proof for each share in this row
+            for (share_index, share_data) in row_shares.iter().enumerate() {
+                let nmt_proof = NMTProof {
+                    share_data: share_data.clone(),
+                    namespace: namespace.clone(),
+                    nodes: namespace_data.proof.nodes.clone(),
+                    end: namespace_data.proof.end,
+                    is_max_namespace_ignored: namespace_data.proof.is_max_namespace_ignored,
+                    axis_index: row_index as u32,
+                    is_row_proof: true, // This is a row proof from GetNamespaceData
+                };
+                nmt_proofs.push(nmt_proof);
             }
         }
 
         debug!(
-            namespace_hex = %namespace_b64,
-            shares_count = decoded_shares.len(),
-            "Retrieved namespace data"
+            namespace_b64 = %namespace_b64,
+            proofs_count = nmt_proofs.len(),
+            rows_with_data = namespace_data_array.len(),
+            "Retrieved namespace data with NMT proofs"
         );
 
-        Ok(decoded_shares)
+        Ok(nmt_proofs)
+    }
+
+    /// Get shares by namespace (backward compatibility)
+    async fn get_shares_by_namespace(
+        &self,
+        header: &CelestiaHeader,
+        namespace: &Namespace,
+    ) -> Result<Vec<Vec<u8>>, DAError> {
+        let proofs = self.get_namespace_data_with_proofs(header, namespace).await?;
+        Ok(proofs.into_iter().map(|proof| proof.share_data).collect())
     }
 
     /// Get a share with proof using Celestia's share.GetShare
@@ -732,6 +843,112 @@ impl CelestiaVerifier {
         }
     }
 
+    /// Verify an NMT proof against the DAH roots
+    fn verify_nmt_proof(&self, proof: &NMTProof, header: &CelestiaHeader) -> bool {
+        // Step 1: Validate proof structure
+        if proof.nodes.is_empty() {
+            debug!("NMT proof has no nodes");
+            return false;
+        }
+
+        // Step 2: Parse expected root from DAH
+        let expected_root = if proof.is_row_proof {
+            if proof.axis_index as usize >= header.dah.row_roots.len() {
+                debug!("Row index {} out of bounds", proof.axis_index);
+                return false;
+            }
+            &header.dah.row_roots[proof.axis_index as usize]
+        } else {
+            if proof.axis_index as usize >= header.dah.column_roots.len() {
+                debug!("Column index {} out of bounds", proof.axis_index);
+                return false;
+            }
+            &header.dah.column_roots[proof.axis_index as usize]
+        };
+
+        // Step 3: Decode the expected root from base64
+        let root_bytes = match general_purpose::STANDARD.decode(expected_root) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                debug!("Failed to decode root: {}", e);
+                return false;
+            }
+        };
+
+        if root_bytes.len() != NAMESPACE_SIZE * 2 + HASH_SIZE {
+            debug!("Invalid root size: {} bytes", root_bytes.len());
+            return false;
+        }
+
+        let mut expected_root_hash = [0u8; HASH_SIZE];
+        expected_root_hash.copy_from_slice(&root_bytes[NAMESPACE_SIZE * 2..]);
+
+        // Step 4: Calculate leaf hash for the share
+        let mut namespace_bytes = [0u8; NAMESPACE_SIZE];
+        namespace_bytes[0] = proof.namespace.version;
+        namespace_bytes[1..].copy_from_slice(&proof.namespace.id);
+
+        let leaf_hash = Self::hash_nmt_leaf(&namespace_bytes, &proof.share_data);
+
+        // Step 5: Verify proof path by walking up the tree
+        let mut current_hash = leaf_hash;
+        let mut current_min_ns = namespace_bytes;
+        let mut current_max_ns = namespace_bytes;
+
+        for node_b64 in &proof.nodes {
+            let sibling_node = match Self::parse_nmt_node(node_b64) {
+                Ok(node) => node,
+                Err(e) => {
+                    debug!("Failed to parse NMT node: {}", e);
+                    return false;
+                }
+            };
+
+            // Combine current hash with sibling
+            let (new_min_ns, new_max_ns, new_hash) = Self::hash_nmt_node(
+                &current_min_ns,
+                &current_max_ns,
+                &current_hash,
+                &sibling_node.min_namespace,
+                &sibling_node.max_namespace,
+                &sibling_node.digest,
+            );
+
+            current_hash = new_hash;
+            current_min_ns = new_min_ns;
+            current_max_ns = new_max_ns;
+        }
+
+        // Step 6: Compare with expected root
+        if current_hash != expected_root_hash {
+            debug!(
+                "NMT proof verification failed: computed hash doesn't match root"
+            );
+            return false;
+        }
+
+        // Step 7: Verify namespace ordering
+        if current_min_ns > current_max_ns {
+            debug!("Invalid namespace ordering in proof");
+            return false;
+        }
+
+        // Step 8: Verify that the share's namespace is within the proven range
+        if namespace_bytes < current_min_ns || namespace_bytes > current_max_ns {
+            debug!("Share namespace outside proven range");
+            return false;
+        }
+
+        debug!(
+            axis = if proof.is_row_proof { "row" } else { "column" },
+            axis_index = proof.axis_index,
+            namespace = %hex::encode(&proof.namespace.id),
+            "NMT proof verified successfully"
+        );
+
+        true
+    }
+
     /// Verify that a sample is valid against the data root
     fn verify_sample(&self, sample: &Sample, header: &CelestiaHeader) -> bool {
         // Basic verification that sample is non-empty and within bounds
@@ -764,14 +981,13 @@ impl CelestiaVerifier {
             return false;
         }
 
-        // TODO: Implement proper NMT proof verification
-        // 1. Verify the merkle proof against the row/column roots
-        // 2. Verify the row/column roots against the data availability header
-        // 3. Verify namespace consistency
-
+        // Implement proper NMT proof verification
         match &sample.proof {
+            Proof::NMT(nmt_proof) => {
+                self.verify_nmt_proof(nmt_proof, header)
+            }
             Proof::Merkle(merkle_proof) => {
-                // Basic merkle proof structure validation
+                // Fallback to basic merkle proof validation for backward compatibility
                 if merkle_proof.branch.is_empty() {
                     debug!("Merkle proof has empty branch");
                     return false;
