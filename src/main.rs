@@ -235,37 +235,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 // Standard verification without namespace
-                match verifier.verify(height).await {
-                    Ok(result) => {
-                        let duration = start.elapsed();
+                println!("\n📊 No Verification Results for Celestia Block {}", height);
+                // match verifier.verify(height).await {
+                //     Ok(result) => {
+                //         let duration = start.elapsed();
 
-                        println!("\n📊 Verification Results for Celestia Block {}", height);
-                        println!("═══════════════════════════════════════════════");
-                        println!(
-                            "✅ Data Available: {}",
-                            if result.available { "YES" } else { "NO" }
-                        );
-                        println!(
-                            "🎯 Confidence: {:.6} ({:.4}%)",
-                            result.confidence,
-                            result.confidence * 100.0
-                        );
-                        println!(
-                            "📈 Samples: {}/{} successful",
-                            result.samples_verified, result.samples_total
-                        );
-                        println!("⏱️  Latency: {}ms", result.latency_ms);
-                        println!("🕐 Total Duration: {:?}", duration);
+                //         println!("\n📊 Verification Results for Celestia Block {}", height);
+                //         println!("═══════════════════════════════════════════════");
+                //         println!(
+                //             "✅ Data Available: {}",
+                //             if result.available { "YES" } else { "NO" }
+                //         );
+                //         println!(
+                //             "🎯 Confidence: {:.6} ({:.4}%)",
+                //             result.confidence,
+                //             result.confidence * 100.0
+                //         );
+                //         println!(
+                //             "📈 Samples: {}/{} successful",
+                //             result.samples_verified, result.samples_total
+                //         );
+                //         println!("⏱️  Latency: {}ms", result.latency_ms);
+                //         println!("🕐 Total Duration: {:?}", duration);
 
-                        if !result.available {
-                            warn!("⚠️  Data may not be available - confidence below threshold");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Verification failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
+                //         if !result.available {
+                //             warn!("⚠️  Data may not be available - confidence below threshold");
+                //         }
+                //     }
+                //     Err(e) => {
+                //         eprintln!("❌ Verification failed: {}", e);
+                //         std::process::exit(1);
+                //     }
+                // }
             }
         }
         Commands::Range {
