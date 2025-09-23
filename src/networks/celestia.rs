@@ -13,12 +13,6 @@ use sha2::{Digest, Sha256};
 use std::time::Instant;
 use tracing::{debug, error, info};
 
-// NMT constants for Celestia
-const NAMESPACE_SIZE: usize = 29; // 1 byte version + 28 bytes ID
-const HASH_SIZE: usize = 32;
-const NMT_LEAF_PREFIX: u8 = 0;
-const NMT_NODE_PREFIX: u8 = 1;
-
 // Celestia-specific types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CelestiaHeader {
@@ -203,81 +197,6 @@ struct SampleCoordinate {
     col: u32,
 }
 
-// NMT hash functions for Celestia verification
-impl CelestiaVerifier {
-    /// Hash a leaf node with namespace prefix (NMT leaf)
-    fn hash_nmt_leaf(namespace: &[u8; NAMESPACE_SIZE], data: &[u8]) -> [u8; HASH_SIZE] {
-        let mut hasher = Sha256::new();
-        hasher.update([NMT_LEAF_PREFIX]); // Leaf prefix
-        hasher.update(namespace); // Min namespace
-        hasher.update(namespace); // Max namespace (same for leaf)
-        hasher.update(data); // Share data
-
-        let result = hasher.finalize();
-        let mut hash = [0u8; HASH_SIZE];
-        hash.copy_from_slice(&result);
-        hash
-    }
-
-    /// Hash two NMT nodes together (internal node)
-    fn hash_nmt_node(
-        left_min_ns: &[u8; NAMESPACE_SIZE],
-        left_max_ns: &[u8; NAMESPACE_SIZE],
-        left_hash: &[u8; HASH_SIZE],
-        right_min_ns: &[u8; NAMESPACE_SIZE],
-        right_max_ns: &[u8; NAMESPACE_SIZE],
-        right_hash: &[u8; HASH_SIZE],
-    ) -> ([u8; NAMESPACE_SIZE], [u8; NAMESPACE_SIZE], [u8; HASH_SIZE]) {
-        let mut hasher = Sha256::new();
-        hasher.update([NMT_NODE_PREFIX]); // Node prefix
-        hasher.update(left_min_ns); // Left min namespace
-        hasher.update(left_max_ns); // Left max namespace
-        hasher.update(left_hash); // Left hash
-        hasher.update(right_min_ns); // Right min namespace
-        hasher.update(right_max_ns); // Right max namespace
-        hasher.update(right_hash); // Right hash
-
-        let result = hasher.finalize();
-        let mut hash = [0u8; HASH_SIZE];
-        hash.copy_from_slice(&result);
-
-        // Combined namespace range
-        let min_ns = if left_min_ns <= right_min_ns { *left_min_ns } else { *right_min_ns };
-        let max_ns = if left_max_ns >= right_max_ns { *left_max_ns } else { *right_max_ns };
-
-        (min_ns, max_ns, hash)
-    }
-
-    /// Parse a base64-encoded NMT node into namespace range and hash
-    fn parse_nmt_node(node_b64: &str) -> Result<NMTNode, DAError> {
-        let decoded = general_purpose::STANDARD
-            .decode(node_b64)
-            .map_err(|e| DAError::NetworkError(format!("Failed to decode NMT node: {}", e)))?;
-
-        // NMT node format: min_ns (29) + max_ns (29) + hash (32) = 90 bytes total
-        if decoded.len() != NAMESPACE_SIZE * 2 + HASH_SIZE {
-            return Err(DAError::NetworkError(format!(
-                "Invalid NMT node size: {} bytes (expected {})",
-                decoded.len(),
-                NAMESPACE_SIZE * 2 + HASH_SIZE
-            )));
-        }
-
-        let mut min_namespace = [0u8; NAMESPACE_SIZE];
-        let mut max_namespace = [0u8; NAMESPACE_SIZE];
-        let mut digest = [0u8; HASH_SIZE];
-
-        min_namespace.copy_from_slice(&decoded[..NAMESPACE_SIZE]);
-        max_namespace.copy_from_slice(&decoded[NAMESPACE_SIZE..NAMESPACE_SIZE * 2]);
-        digest.copy_from_slice(&decoded[NAMESPACE_SIZE * 2..]);
-
-        Ok(NMTNode {
-            min_namespace,
-            max_namespace,
-            digest,
-        })
-    }
-}
 
 pub struct CelestiaVerifier {
     config: CelestiaConfig,
@@ -748,7 +667,7 @@ impl CelestiaVerifier {
     /// Verify an NMT proof against the DAH roots
     /// For namespace proofs from GetNamespaceData, we use a pragmatic approach:
     /// successful retrieval with valid proof structure indicates availability
-    fn verify_nmt_proof(&self, proof: &NMTProof, header: &CelestiaHeader) -> bool {
+    fn verify_nmt_proof(&self, proof: &NMTProof, _header: &CelestiaHeader) -> bool {
         // Step 1: Validate proof structure
         if proof.nodes.is_empty() {
             debug!("NMT proof has no nodes");
@@ -1019,7 +938,7 @@ impl DAVerifier for CelestiaVerifier {
         let coords = sampler.generate_coordinates();
 
         // Step 3: Sample shares using proper DAS + optional namespace fetching
-        let (samples, namespace_data) = self.sample_das_and_namespace(height, &header, &coords).await?;
+        let (samples, _namespace_data) = self.sample_das_and_namespace(height, &header, &coords).await?;
 
         let mut successful_samples = 0;
         let total_samples = samples.len();
@@ -1101,16 +1020,16 @@ pub fn parse_namespace(namespace_hex: &str) -> Result<Namespace, DAError> {
     }
 }
 
-/// Generate a random namespace for testing
-pub fn random_namespace() -> Namespace {
-    use rand::Rng;
-    let mut rng = rand::rng();
+/// Generate a random namespace for testing (UNUSED)
+// pub fn random_namespace() -> Namespace {
+//     use rand::Rng;
+//     let mut rng = rand::rng();
 
-    let mut id = vec![0u8; 28];
-    rng.fill(&mut id[..]);
+//     let mut id = vec![0u8; 28];
+//     rng.fill(&mut id[..]);
 
-    Namespace { version: 0, id }
-}
+//     Namespace { version: 0, id }
+// }
 
 #[cfg(test)]
 mod tests {
