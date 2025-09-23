@@ -108,6 +108,26 @@ pub struct VerificationResult {
     pub latency_ms: u64,
 }
 
+/// Enhanced verification result that separates DAS from namespace verification
+#[derive(Debug, Clone)]
+pub struct EnhancedVerificationResult {
+    pub das_result: VerificationResult,
+    pub namespace_result: Option<NamespaceResult>,
+}
+
+/// Result of namespace-specific data verification
+#[derive(Debug, Clone)]
+pub struct NamespaceResult {
+    pub namespace: String, // Hex-encoded namespace
+    pub shares_found: usize,
+    pub data_available: bool,
+    pub proofs_valid: bool,
+    pub namespace_confidence: f64,
+    pub block_available: bool,
+    pub retrieval_successful: bool,
+    pub availability_guaranteed: bool,
+}
+
 /// Errors that can occur during verification
 #[derive(Debug, Error)]
 pub enum DAError {

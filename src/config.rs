@@ -91,7 +91,7 @@ impl Default for DAConfig {
         Self {
             celestia: Some(CelestiaConfig {
                 endpoints: vec![
-                    "http://91.99.137.205:26658".to_string(),
+                    "http://91.107.209.248:26658".to_string(),
                     "https://celestia-rpc.brightlystake.com/api".to_string(),
                     "https://celestia.rest.lava.build".to_string(),
                 ],

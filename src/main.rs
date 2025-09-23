@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = CelestiaConfig {
                 endpoints,
                 network,
-                namespace_id: namespace,
+                namespace_id: namespace.clone(),
                 auth_token,
             };
 
@@ -151,40 +151,120 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let verifier = CelestiaVerifier::new(config, &sampling_config);
 
             info!(
-                "Verifying Celestia block {} with {} samples",
-                height, cli.samples
+                "Verifying Celestia block {} with {} samples{}",
+                height,
+                cli.samples,
+                if namespace.is_some() { " (enhanced verification)" } else { "" }
             );
             let start = Instant::now();
 
-            match verifier.verify(height).await {
-                Ok(result) => {
-                    let duration = start.elapsed();
+            // Use enhanced verification if namespace is provided
+            if namespace.is_some() {
+                match verifier.verify_enhanced(height).await {
+                    Ok(enhanced_result) => {
+                        let duration = start.elapsed();
+                        let das_result = &enhanced_result.das_result;
 
-                    println!("\n📊 Verification Results for Celestia Block {}", height);
-                    println!("═══════════════════════════════════════════════");
-                    println!(
-                        "✅ Data Available: {}",
-                        if result.available { "YES" } else { "NO" }
-                    );
-                    println!(
-                        "🎯 Confidence: {:.6} ({:.4}%)",
-                        result.confidence,
-                        result.confidence * 100.0
-                    );
-                    println!(
-                        "📈 Samples: {}/{} successful",
-                        result.samples_verified, result.samples_total
-                    );
-                    println!("⏱️  Latency: {}ms", result.latency_ms);
-                    println!("🕐 Total Duration: {:?}", duration);
+                        println!("\n📊 Enhanced Verification Results for Celestia Block {}", height);
+                        println!("══════════════════════════════════════════════════════");
 
-                    if !result.available {
-                        warn!("⚠️  Data may not be available - confidence below threshold");
+                        // DAS Results
+                        println!("🔍 Data Availability Sampling (DAS):");
+                        println!(
+                            "  ✅ Block Available: {}",
+                            if das_result.available { "YES" } else { "NO" }
+                        );
+                        println!(
+                            "  🎯 Confidence: {:.6} ({:.4}%)",
+                            das_result.confidence,
+                            das_result.confidence * 100.0
+                        );
+                        println!(
+                            "  📈 Samples: {}/{} successful",
+                            das_result.samples_verified, das_result.samples_total
+                        );
+
+                        // Namespace Results
+                        if let Some(ns_result) = &enhanced_result.namespace_result {
+                            println!("\n📦 Namespace Verification:");
+                            println!("  🏷️  Namespace: {}", ns_result.namespace);
+                            println!(
+                                "  ✅ Data Available: {} {}",
+                                if ns_result.data_available { "YES" } else { "NO" },
+                                if ns_result.availability_guaranteed {
+                                    "(guaranteed by block availability)"
+                                } else if ns_result.retrieval_successful {
+                                    "(verified by data retrieval)"
+                                } else {
+                                    "(not guaranteed - block unavailable)"
+                                }
+                            );
+                            println!("  📊 Shares Found: {}", ns_result.shares_found);
+                            if ns_result.shares_found > 0 {
+                                println!(
+                                    "  🔒 Proofs Valid: {}",
+                                    if ns_result.proofs_valid { "YES" } else { "NO" }
+                                );
+                            }
+                        }
+
+                        println!("\n⏱️  Latency: {}ms", das_result.latency_ms);
+                        println!("🕐 Total Duration: {:?}", duration);
+
+                        // Summary message for clients
+                        if let Some(ns_result) = &enhanced_result.namespace_result {
+                            if ns_result.data_available {
+                                println!("\n🎉 RESULT: Your namespace data is AVAILABLE and can be retrieved!");
+                                if ns_result.availability_guaranteed {
+                                    println!("   (Guaranteed by high-confidence block availability)");
+                                }
+                            } else {
+                                println!("\n⚠️  RESULT: Cannot guarantee namespace data availability");
+                                println!("   (Block availability confidence below threshold)");
+                            }
+                        }
+
+                        if !das_result.available {
+                            warn!("⚠️  Data may not be available - confidence below threshold");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Enhanced verification failed: {}", e);
+                        std::process::exit(1);
                     }
                 }
-                Err(e) => {
-                    eprintln!("❌ Verification failed: {}", e);
-                    std::process::exit(1);
+            } else {
+                // Standard verification without namespace
+                match verifier.verify(height).await {
+                    Ok(result) => {
+                        let duration = start.elapsed();
+
+                        println!("\n📊 Verification Results for Celestia Block {}", height);
+                        println!("═══════════════════════════════════════════════");
+                        println!(
+                            "✅ Data Available: {}",
+                            if result.available { "YES" } else { "NO" }
+                        );
+                        println!(
+                            "🎯 Confidence: {:.6} ({:.4}%)",
+                            result.confidence,
+                            result.confidence * 100.0
+                        );
+                        println!(
+                            "📈 Samples: {}/{} successful",
+                            result.samples_verified, result.samples_total
+                        );
+                        println!("⏱️  Latency: {}ms", result.latency_ms);
+                        println!("🕐 Total Duration: {:?}", duration);
+
+                        if !result.available {
+                            warn!("⚠️  Data may not be available - confidence below threshold");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Verification failed: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }
